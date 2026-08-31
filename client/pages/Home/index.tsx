@@ -39,14 +39,26 @@ interface Recommendation {
   conflicts: string[];
 }
 
-// Region suffixes to scan (environment prefix is derived at runtime)
-const REGION_SUFFIXES = ["sg", "hk", "us", "nl"];
+/** Preferred region order when scanning. */
+const REGION_PRIORITY = ["sg", "hk", "us", "nl"];
 
-/** Build scan order from the embed profile (e.g. "prod-sg" → prod_*) or fall back to staging. */
-function buildScanOrder(profile: string | null): string[] {
-  // Extract environment prefix: "prod-sg" → "prod", "staging-hk" → "staging"
-  const envPrefix = profile?.split("-")[0] ?? "staging";
-  return REGION_SUFFIXES.map((r) => `${envPrefix}_${r}`);
+/** Tags to exclude from scanning (dev/demo environments). */
+const EXCLUDED_PREFIXES = ["dev", "demo", "localhost"];
+
+/**
+ * Build scan order from all available data tags.
+ * Excludes dev/demo tags, then sorts by region priority.
+ */
+function buildScanOrder(availableKeys: string[]): string[] {
+  const candidates = availableKeys.filter(
+    (key) => !EXCLUDED_PREFIXES.some((p) => key.startsWith(p)),
+  );
+  // Sort by region priority — known regions first, then the rest
+  return candidates.sort((a, b) => {
+    const aIdx = REGION_PRIORITY.findIndex((r) => a.endsWith(`_${r}`));
+    const bIdx = REGION_PRIORITY.findIndex((r) => b.endsWith(`_${r}`));
+    return (aIdx === -1 ? 999 : aIdx) - (bIdx === -1 ? 999 : bIdx);
+  });
 }
 
 const INITIAL_INPUTS = {
@@ -72,7 +84,7 @@ export default function HomePage() {
   const [resolvedTag, setResolvedTag] = useState<string | null>(null);
 
   const { dataTags, setDataTag } = useSuperblocksDataTags();
-  const { airboardToken, profile } = useEmbed();
+  const { airboardToken } = useEmbed();
   const { run: analyseEscalation } = useApi("AnalyseEscalation");
   const cancelledRef = useRef(false);
 
@@ -98,8 +110,7 @@ export default function HomePage() {
     const accountId = inputs.accountId.trim();
 
     const availableKeys = dataTags?.available.map((t) => t.key) ?? [];
-    const scanOrder = buildScanOrder(profile);
-    const tagsToScan = scanOrder.filter((key) => availableKeys.includes(key));
+    const tagsToScan = buildScanOrder(availableKeys);
 
     if (tagsToScan.length === 0) {
       setError("No data tags available for scanning.");
@@ -219,7 +230,7 @@ export default function HomePage() {
       setLoading(false);
       setScanStatus(null);
     }
-  }, [inputs, analyseEscalation, dataTags, setDataTag, airboardToken, profile]);
+  }, [inputs, analyseEscalation, dataTags, setDataTag, airboardToken]);
 
   const handleCopy = useCallback(() => {
     if (!recommendation) return;
