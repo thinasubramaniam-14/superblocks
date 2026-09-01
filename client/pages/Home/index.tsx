@@ -345,12 +345,23 @@ export default function HomePage() {
                 }
 
                 // Compare routing priority — lower number = higher priority
-                const initialPriority =
-                  ROUTING_PRIORITY[finalRec.recommendedTeam] ?? 6;
-                const crossPriority =
-                  ROUTING_PRIORITY[crossRec.recommendedTeam] ?? 6;
+                // Extract base team name before " / ENTITY" suffix
+                const baseTeam = (team: string) =>
+                  team.split(" / ")[0] as keyof typeof ROUTING_PRIORITY;
 
-                if (crossPriority < initialPriority) {
+                const initialPriority =
+                  ROUTING_PRIORITY[baseTeam(finalRec.recommendedTeam)] ?? 6;
+                const crossPriority =
+                  ROUTING_PRIORITY[baseTeam(crossRec.recommendedTeam)] ?? 6;
+
+                // Prefer cross-region if higher priority, OR same priority
+                // but cross-region found actual cases while initial didn't
+                if (
+                  crossPriority < initialPriority ||
+                  (crossPriority === initialPriority &&
+                    baseTeam(crossRec.recommendedTeam) !== "CS" &&
+                    baseTeam(finalRec.recommendedTeam) === "CS")
+                ) {
                   finalRec = crossRec;
                   finalTag = crossRegionTag;
                   finalDisplay = crossDisplay;
