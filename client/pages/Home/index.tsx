@@ -71,6 +71,60 @@ function buildScanOrder(availableKeys: string[]): string[] {
   });
 }
 
+/**
+ * Routing priority — lower number = higher priority.
+ * Used to compare results from different regional scans.
+ */
+const ROUTING_PRIORITY: Record<string, number> = {
+  "Global Watchlist": 0,
+  "PA Risk Ops": 1,
+  MRM: 2,
+  KYC: 3,
+  KYB: 4,
+  TM: 5,
+  CS: 6,
+};
+
+/**
+ * Given an owningEntity string (e.g. "AIRWALLEX_HK"), find the matching
+ * regional data-tag key from available tags — but only if it differs from
+ * the tag we already scanned.
+ *
+ * Matching logic:
+ *  - Extract the region suffix from owningEntity (last segment after "_").
+ *  - Extract the environment prefix from currentTag (everything before the
+ *    last "_", e.g. "staging" from "staging_sg").
+ *  - Look for `<envPrefix>_<region>` in availableKeys.
+ */
+function getOwningEntityRegionTag(
+  owningEntity: string,
+  availableKeys: string[],
+  currentTag: string,
+): string | null {
+  const parts = owningEntity.split("_");
+  if (parts.length < 2) return null;
+
+  const region = parts[parts.length - 1].toLowerCase();
+  const lastUnderscore = currentTag.lastIndexOf("_");
+  if (lastUnderscore === -1) return null;
+
+  const envPrefix = currentTag.substring(0, lastUnderscore);
+  const targetTag = `${envPrefix}_${region}`;
+
+  // Same tag we already used → nothing to do
+  if (targetTag === currentTag) return null;
+
+  // Must exist in available (non-excluded) tags
+  if (
+    availableKeys.includes(targetTag) &&
+    !EXCLUDED_PREFIXES.some((p) => targetTag.startsWith(p))
+  ) {
+    return targetTag;
+  }
+
+  return null;
+}
+
 const INITIAL_INPUTS = {
   accountId: "",
   cle: "",
@@ -180,7 +234,7 @@ export default function HomePage() {
       return;
     }
 
-    // Phase 2: Account found — run full analysis
+    // Phase 2: Account found — run full analysis on the resolved tag
     const resolvedDisplay =
       dataTags?.available.find((t) => t.key === foundInTag)?.displayName ??
       foundInTag;
@@ -190,41 +244,127 @@ export default function HomePage() {
     setDataTag(foundInTag);
     await new Promise((r) => setTimeout(r, 150));
 
-    try {
-      const result = await analyseEscalation({
-        accountId,
-        airboardToken,
-        ticketContext: null,
-        userId: null,
-        email: null,
-        cardholderId: null,
-        cardId: null,
-        transactionId: null,
-        depositId: null,
-        payoutId: null,
-        cle: inputs.cle.trim() || null,
-      });
+    const analysisInputs = {
+      accountId,
+      airboardToken,
+      ticketContext: null,
+      userId: null,
+      email: null,
+      cardholderId: null,
+      cardId: null,
+      transactionId: null,
+      depositId: null,
+      payoutId: null,
+      cle: inputs.cle.trim() || null,
+    };
 
-      if (result?.error) {
-        if (result.error.includes("was not found")) {
+    try {
+      const initialResult = await analyseEscalation(analysisInputs);
+
+      if (cancelledRef.current) {
+        setLoading(false);
+        setScanStatus(null);
+        return;
+      }
+
+      if (initialResult?.error) {
+        if (initialResult.error.includes("was not found")) {
           setError(
             `Account resolved in ${resolvedDisplay} but sources returned no data. This may indicate a permissions issue.`,
           );
         } else {
-          setError(result.error);
+          setError(initialResult.error);
         }
-      } else if (result?.recommendation) {
-        const rec = result.recommendation as Recommendation;
-        if (resolveInfo?.owningEntity && !rec.supportingInfo.owningEntity) {
-          rec.supportingInfo.owningEntity = resolveInfo.owningEntity;
-        }
-        if (resolveInfo?.dataCenter && !rec.supportingInfo.region) {
-          rec.supportingInfo.region = resolveInfo.dataCenter;
-        }
-        setRecommendation(rec);
-      } else {
-        setError("No recommendation returned. Please try again.");
+        setLoading(false);
+        setScanStatus(null);
+        return;
       }
+
+      if (!initialResult?.recommendation) {
+        setError("No recommendation returned. Please try again.");
+        setLoading(false);
+        setScanStatus(null);
+        return;
+      }
+
+      let finalRec = initialResult.recommendation as Recommendation;
+      let finalTag = foundInTag;
+      let finalDisplay = resolvedDisplay;
+
+      // Enrich with resolve info if missing
+      if (resolveInfo?.owningEntity && !finalRec.supportingInfo.owningEntity) {
+        finalRec.supportingInfo.owningEntity = resolveInfo.owningEntity;
+      }
+      if (resolveInfo?.dataCenter && !finalRec.supportingInfo.region) {
+        finalRec.supportingInfo.region = resolveInfo.dataCenter;
+      }
+
+      // --- Phase 3: Cross-region re-analysis ---
+      // If the owning entity maps to a different regional tag, re-run analysis
+      // there and keep whichever result has higher-priority routing.
+      const owningEntity =
+        finalRec.supportingInfo.owningEntity ?? resolveInfo?.owningEntity;
+      if (owningEntity) {
+        const crossRegionTag = getOwningEntityRegionTag(
+          owningEntity,
+          availableKeys,
+          foundInTag,
+        );
+
+        if (crossRegionTag) {
+          const crossDisplay =
+            dataTags?.available.find((t) => t.key === crossRegionTag)
+              ?.displayName ?? crossRegionTag;
+          setScanStatus(
+            `Owning entity is ${owningEntity}. Checking ${crossDisplay}…`,
+          );
+
+          setDataTag(crossRegionTag);
+          await new Promise((r) => setTimeout(r, 150));
+
+          if (!cancelledRef.current) {
+            try {
+              const crossResult = await analyseEscalation(analysisInputs);
+
+              if (
+                crossResult?.recommendation &&
+                !crossResult.error
+              ) {
+                const crossRec =
+                  crossResult.recommendation as Recommendation;
+
+                // Enrich cross-region result too
+                if (!crossRec.supportingInfo.owningEntity && owningEntity) {
+                  crossRec.supportingInfo.owningEntity = owningEntity;
+                }
+                if (
+                  !crossRec.supportingInfo.region &&
+                  resolveInfo?.dataCenter
+                ) {
+                  crossRec.supportingInfo.region = resolveInfo.dataCenter;
+                }
+
+                // Compare routing priority — lower number = higher priority
+                const initialPriority =
+                  ROUTING_PRIORITY[finalRec.recommendedTeam] ?? 6;
+                const crossPriority =
+                  ROUTING_PRIORITY[crossRec.recommendedTeam] ?? 6;
+
+                if (crossPriority < initialPriority) {
+                  finalRec = crossRec;
+                  finalTag = crossRegionTag;
+                  finalDisplay = crossDisplay;
+                }
+              }
+            } catch {
+              // Cross-region scan failed — keep initial result
+            }
+          }
+        }
+      }
+
+      setResolvedTag(finalDisplay);
+      setRecommendation(finalRec);
     } catch (err) {
       const message =
         err && typeof err === "object" && "message" in err
