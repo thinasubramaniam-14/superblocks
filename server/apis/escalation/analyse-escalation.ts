@@ -1245,8 +1245,9 @@ export default api({
                 ? `Account on global watchlist (${globalWatchlistCategory ?? "Unknown"}): ${globalWatchlistReason ?? "requires review"}`
                 : "PA Risk Ops review in progress";
 
-      suggestedInternalAction =
-        "Escalate to PA Risk Ops queue. Do not route to KYC.";
+      suggestedInternalAction = globalWatchlistActive
+        ? "Raise Jira ticket at https://airwallex.atlassian.net/servicedesk/customer/portal/111/group/297"
+        : "Escalate to PA Risk Ops queue. Do not route to KYC.";
     }
 
     // ----- KYC -----
