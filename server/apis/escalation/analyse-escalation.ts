@@ -97,6 +97,7 @@ export default api({
     transactionId: z.string().nullable(),
     depositId: z.string().nullable(),
     payoutId: z.string().nullable(),
+    cle: z.string().nullable(),
   }),
 
   output: OutputSchema,

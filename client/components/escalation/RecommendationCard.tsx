@@ -36,7 +36,7 @@ interface RecommendationCardProps {
 const TEAM_STYLES: Record<string, string> = {
   KYC: "bg-[#dbeafe] text-[#1e40af] border-[#93c5fd]",
   TM: "bg-[#ede9fe] text-[#5b21b6] border-[#c4b5fd]",
-  PA: "bg-[#fee2e2] text-[#991b1b] border-[#fca5a5]",
+  PA: "bg-[#fff1e6] text-[#c2410c] border-[#fdba74]",
 };
 
 function getTeamStyle(team: string) {
@@ -77,8 +77,8 @@ export default function RecommendationCard({
   return (
     <div className="rounded-lg border border-[#e2e5ea] bg-white shadow-sm overflow-hidden">
       {/* Header */}
-      <div className="px-5 py-3 border-b border-[#e2e5ea] bg-[#fafbfc]">
-        <h2 className="text-sm font-semibold text-[#111827]">
+      <div className="px-5 py-3 border-b border-[#e2e5ea] bg-[#111111]">
+        <h2 className="text-sm font-semibold text-white">
           Escalation Recommendation
         </h2>
       </div>
@@ -122,11 +122,11 @@ export default function RecommendationCard({
         </div>
 
         {/* Customer message */}
-        <div className="rounded-md bg-[#eff6ff] border border-[#bfdbfe] p-3">
-          <FieldLabel className="text-[#1e40af]">
+        <div className="rounded-md bg-[#fff7ed] border border-[#fed7aa] p-3">
+          <FieldLabel className="text-[#c2410c]">
             What CS Should Tell the Customer
           </FieldLabel>
-          <p className="mt-1 text-[13px] text-[#1e3a5f] leading-relaxed">
+          <p className="mt-1 text-[13px] text-[#431407] leading-relaxed">
             {customerMessage}
           </p>
         </div>

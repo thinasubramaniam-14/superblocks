@@ -63,13 +63,7 @@ function buildScanOrder(availableKeys: string[]): string[] {
 
 const INITIAL_INPUTS = {
   accountId: "",
-  userId: "",
-  email: "",
-  cardholderId: "",
-  cardId: "",
-  transactionId: "",
-  depositId: "",
-  payoutId: "",
+  cle: "",
 };
 
 export default function HomePage() {
@@ -191,13 +185,14 @@ export default function HomePage() {
         accountId,
         airboardToken,
         ticketContext: null,
-        userId: inputs.userId.trim() || null,
-        email: inputs.email.trim() || null,
-        cardholderId: inputs.cardholderId.trim() || null,
-        cardId: inputs.cardId.trim() || null,
-        transactionId: inputs.transactionId.trim() || null,
-        depositId: inputs.depositId.trim() || null,
-        payoutId: inputs.payoutId.trim() || null,
+        userId: null,
+        email: null,
+        cardholderId: null,
+        cardId: null,
+        transactionId: null,
+        depositId: null,
+        payoutId: null,
+        cle: inputs.cle.trim() || null,
       });
 
       if (result?.error) {
@@ -297,7 +292,7 @@ export default function HomePage() {
   }, []);
 
   return (
-    <div className="flex flex-col min-h-svh bg-[#f5f6f8]">
+    <div className="flex flex-col min-h-svh bg-[#fafafa]">
       {/* Airboard-style header */}
       <AppHeader />
 
@@ -311,27 +306,21 @@ export default function HomePage() {
           </p>
 
           {/* Input card */}
-          <div className="rounded-lg border border-[#e2e5ea] bg-white shadow-sm">
+          <div className="rounded-lg border border-[#e2e5ea] bg-white shadow-sm overflow-hidden">
             <div className="px-5 py-4">
               <EscalationInputs
                 accountId={inputs.accountId}
-                userId={inputs.userId}
-                email={inputs.email}
-                cardholderId={inputs.cardholderId}
-                cardId={inputs.cardId}
-                transactionId={inputs.transactionId}
-                depositId={inputs.depositId}
-                payoutId={inputs.payoutId}
+                cle={inputs.cle}
                 onChange={handleInputChange}
               />
             </div>
 
             {/* Actions bar */}
-            <div className="flex items-center gap-3 px-5 py-3 border-t border-[#e2e5ea] bg-[#fafbfc]">
+            <div className="flex items-center gap-3 px-5 py-3 border-t border-[#e2e5ea] bg-[#fafafa]">
               <Button
                 onClick={handleAnalyse}
                 disabled={loading}
-                className="bg-[#0a1e3d] hover:bg-[#152d52] text-white text-sm h-9 px-4"
+                className="bg-[#FF6B00] hover:bg-[#e55f00] text-white text-sm h-9 px-4"
               >
                 {loading ? (
                   <>
