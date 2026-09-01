@@ -19,6 +19,9 @@ interface SupportingInfo {
   kybCaseStatus: string | null;
   nsCasesSummary: string | null;
   realtimeTmSummary: string | null;
+  globalWatchlistStatus: string | null;
+  globalWatchlistCategory: string | null;
+  globalWatchlistReason: string | null;
 }
 
 interface Recommendation {
@@ -232,6 +235,18 @@ export default function RecommendationCard({
               label="Realtime TM"
               value={supportingInfo.realtimeTmSummary}
             />
+            {supportingInfo.globalWatchlistStatus && (
+              <>
+                <InfoRow
+                  label="Global Watchlist"
+                  value={`${supportingInfo.globalWatchlistStatus} — ${supportingInfo.globalWatchlistCategory ?? "Unknown"}`}
+                />
+                <InfoRow
+                  label="Watchlist Reason"
+                  value={supportingInfo.globalWatchlistReason}
+                />
+              </>
+            )}
           </div>
         )}
       </div>

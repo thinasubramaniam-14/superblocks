@@ -55,6 +55,10 @@ const RecommendationSchema = z.object({
     kybCaseStatus: z.string().nullable(),
     nsCasesSummary: z.string().nullable(),
     realtimeTmSummary: z.string().nullable(),
+    // Global watchlist fields
+    globalWatchlistStatus: z.string().nullable(),
+    globalWatchlistCategory: z.string().nullable(),
+    globalWatchlistReason: z.string().nullable(),
   }),
   missingInputs: z.array(z.string()),
   conflicts: z.array(z.string()),
@@ -152,6 +156,7 @@ export default api({
       cardholdersResult,
       issuingAccountResult,
       watchlistResult,
+      globalWatchlistResult,
       legalEntityResult,
     ] = await Promise.all([
       // 1. KYC cases via airboard-ng-kyc-service
@@ -503,7 +508,45 @@ export default api({
         ),
       ),
 
-      // 9. NEW: Resolve Legal Entity ID (unless CLE provided in input)
+      // 9. Global Watchlist lookup via compliance-graphql (awxGlobalWatchList)
+      safeQuery(() =>
+        ctx.integrations.compliance_graphql.query(
+          `query {
+            isFieldInListWithMatchedElements(request: {
+              listType: "awxGlobalWatchList",
+              listAttributes: [{ fieldName: "accountId", fieldValue: "${accountId}", checkType: EQUAL }]
+            }) {
+              listType
+              listElementId
+              status
+              listElement
+            }
+          }`,
+          {
+            response: z.object({
+              data: z
+                .object({
+                  isFieldInListWithMatchedElements: z
+                    .array(
+                      z.object({
+                        listType: z.string().nullable().optional(),
+                        listElementId: z.string().nullable().optional(),
+                        status: z.string().nullable().optional(),
+                        listElement: z.record(z.unknown()).nullable().optional(),
+                      }),
+                    )
+                    .nullable(),
+                })
+                .nullable(),
+            }),
+          },
+          {},
+          { label: "Check awxGlobalWatchList for account" },
+          graphqlHeaders,
+        ),
+      ),
+
+      // 10. Resolve Legal Entity ID (unless CLE provided in input)
       input.cle
         ? Promise.resolve(input.cle)
         : safeQuery(() =>
@@ -550,7 +593,23 @@ export default api({
         (a: { watchlistHit?: boolean | null }) => a.watchlistHit === true,
       );
 
-    // Resolve legalEntityId: input.cle > API result > KYC case fallback
+    // Parse global watchlist (awxGlobalWatchList) entries
+    const globalWatchlistEntries =
+      globalWatchlistResult?.data?.isFieldInListWithMatchedElements ?? [];
+    const activeGlobalWatchlistEntries = globalWatchlistEntries.filter(
+      (e: { status?: string | null }) => e.status === "ACTIVE",
+    );
+    const globalWatchlistActive = activeGlobalWatchlistEntries.length > 0;
+    const globalWatchlistCategory =
+      activeGlobalWatchlistEntries.length > 0
+        ? String(activeGlobalWatchlistEntries[0].listElement?.category ?? "Unknown")
+        : null;
+    const globalWatchlistReason =
+      activeGlobalWatchlistEntries.length > 0
+        ? String(activeGlobalWatchlistEntries[0].listElement?.reason ?? activeGlobalWatchlistEntries[0].listElement?.description ?? "")
+        : null;
+
+    // Resolve legalEntityId: input.cle > API result > KYC case > RFI session > global watchlist
     let legalEntityId: string | null = null;
     if (typeof legalEntityResult === "string") {
       // input.cle was provided
@@ -567,6 +626,13 @@ export default api({
     // Fallback: extract from RFI sessions
     if (!legalEntityId && rfiSessions.length > 0) {
       legalEntityId = rfiSessions[0].clientLegalEntityId ?? null;
+    }
+    // Fallback: extract from global watchlist entry
+    if (!legalEntityId && activeGlobalWatchlistEntries.length > 0) {
+      const wlCle = activeGlobalWatchlistEntries[0].listElement?.clientLegalEntityId;
+      if (typeof wlCle === "string" && wlCle.length > 0) {
+        legalEntityId = wlCle;
+      }
     }
 
     // ====================================================================
@@ -744,7 +810,21 @@ export default api({
         safeQuery(() =>
           ctx.integrations.postmonitoring_graphql.query(
             `query {
-              nsListCases(query: { accountId: "${accountId}", legalEntityId: "${legalEntityId}", pageNum: 1, pageSize: 20 }) {
+              nsListCases(listCaseReqInput: {
+                accountId: "${accountId}",
+                caseType: REVIEW,
+                customerSegments: [],
+                level: [],
+                ownerOrgLevel2s: [],
+                owningEntity: [],
+                pageIndex: 0,
+                pageSize: 20,
+                referenceType: [],
+                rfiSessionStatuses: [],
+                screeningTypes: [],
+                status: [],
+                transactionCurrencies: []
+              }) {
                 total
                 cases {
                   uuid
@@ -799,15 +879,26 @@ export default api({
         ),
 
         // E. Realtime TM cases via compliance-graphql
-        safeQuery(() =>
-          ctx.integrations.compliance_graphql.query(
+        safeQuery(() => {
+          // getRealtimeCaseList requires a time range — scan last 2 years
+          const now = new Date();
+          const twoYearsAgo = new Date(now);
+          twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+          const fmtDate = (d: Date) => d.toISOString().split("T")[0];
+          return ctx.integrations.compliance_graphql.query(
             `query {
-              getRealtimeCaseList(request: { clientLegalEntityId: "${legalEntityId}", page: 0, size: 20 }) {
+              getRealtimeCaseList(request: {
+                clientLegalEntityId: "${legalEntityId}",
+                skip: 0,
+                limit: 20,
+                createTimeStart: "${fmtDate(twoYearsAgo)}",
+                createTimeEnd: "${fmtDate(now)}"
+              }) {
                 hasNext
-                values {
-                  caseId
+                total
+                data {
+                  id
                   status
-                  caseType
                   clientLegalEntityId
                 }
               }
@@ -819,12 +910,12 @@ export default api({
                     getRealtimeCaseList: z
                       .object({
                         hasNext: z.boolean().nullable().optional(),
-                        values: z
+                        total: z.number().nullable().optional(),
+                        data: z
                           .array(
                             z.object({
-                              caseId: z.string().nullable().optional(),
+                              id: z.string().nullable().optional(),
                               status: z.string().nullable().optional(),
-                              caseType: z.string().nullable().optional(),
                               clientLegalEntityId: z.string().nullable().optional(),
                             }),
                           )
@@ -839,8 +930,8 @@ export default api({
             {},
             { label: "Get realtime TM cases by legalEntityId" },
             graphqlHeaders,
-          ),
-        ),
+          );
+        }),
       ]);
 
       // Parse Phase 2 results
@@ -848,7 +939,14 @@ export default api({
       kybCases = kybResult?.data?.getCaseList?.caseListDtos ?? [];
       kybOngoingCases = kybOngoingResult?.data?.getOngoingCaseListV2?.caseListDtos ?? [];
       nsCases = nsResult?.data?.nsListCases?.cases ?? [];
-      realtimeTmCases = realtimeResult?.data?.getRealtimeCaseList?.values ?? [];
+      realtimeTmCases = (realtimeResult?.data?.getRealtimeCaseList?.data ?? []).map(
+        (c: { id?: string | null; status?: string | null; clientLegalEntityId?: string | null }) => ({
+          caseId: c.id ?? null,
+          status: c.status ?? null,
+          caseType: null as string | null,
+          clientLegalEntityId: c.clientLegalEntityId ?? null,
+        }),
+      );
     }
 
     // ====================================================================
@@ -868,7 +966,8 @@ export default api({
       kybCases.length > 0 ||
       kybOngoingCases.length > 0 ||
       nsCases.length > 0 ||
-      realtimeTmCases.length > 0;
+      realtimeTmCases.length > 0 ||
+      globalWatchlistActive;
 
     if (!anyDataFound) {
       return {
@@ -992,7 +1091,8 @@ export default api({
       universalCases.length > 0 ||
       allActiveKyb.length > 0 ||
       activeNsCases.length > 0 ||
-      activeRealtimeTm.length > 0;
+      activeRealtimeTm.length > 0 ||
+      globalWatchlistActive;
 
     // ====================================================================
     // OWNING ENTITY + REGION
@@ -1087,7 +1187,8 @@ export default api({
       paCases.length > 0 ||
       hasWatchlistPaSignal ||
       nsWithPaSignal.length > 0 ||
-      universalPaCases.length > 0
+      universalPaCases.length > 0 ||
+      globalWatchlistActive
     ) {
       routingCategory = "PA Risk Ops";
 
@@ -1116,13 +1217,20 @@ export default api({
           `${universalPaCases.length} universal PA case(s)`,
         );
       }
+      if (globalWatchlistActive) {
+        paSignals.push(
+          `Global watchlist: ${globalWatchlistCategory ?? "Unknown"} — ${globalWatchlistReason ?? "no reason given"}`,
+        );
+      }
 
       escalationPoint =
         nsWithPaSignal.length > 0
           ? `Name screening match: ${[...new Set(nsWithPaSignal.flatMap((c) => c.categories ?? []))].join(", ")}`
           : hasWatchlistPaSignal
             ? `Watchlist hit: ${watchlistCategories.join(", ")}`
-            : "PA Risk Ops case or restriction";
+            : globalWatchlistActive
+              ? `Global watchlist: ${globalWatchlistCategory ?? "Unknown"}`
+              : "PA Risk Ops case or restriction";
 
       currentStatus = paSignals.join(" | ");
 
@@ -1133,7 +1241,9 @@ export default api({
             ? `Name screening match requires PA Risk Ops review (${[...new Set(nsWithPaSignal.flatMap((c) => c.categories ?? []))].join(", ")})`
             : hasWatchlistPaSignal
               ? `Watchlist match requires PA Risk Ops review (${watchlistCategories.join(", ")})`
-              : "PA Risk Ops review in progress";
+              : globalWatchlistActive
+                ? `Account on global watchlist (${globalWatchlistCategory ?? "Unknown"}): ${globalWatchlistReason ?? "requires review"}`
+                : "PA Risk Ops review in progress";
 
       suggestedInternalAction =
         "Escalate to PA Risk Ops queue. Do not route to KYC.";
@@ -1333,7 +1443,8 @@ export default api({
       input.ticketContext &&
       input.ticketContext.toLowerCase().includes("watchlist") &&
       activeNsCases.length === 0 &&
-      watchlistHitCount === 0
+      watchlistHitCount === 0 &&
+      !globalWatchlistActive
     ) {
       conflicts.push(
         "Ticket mentions watchlist but no active NS cases or watchlist hits found",
@@ -1403,6 +1514,10 @@ export default api({
         kybCaseStatus,
         nsCasesSummary,
         realtimeTmSummary,
+        // Global watchlist fields
+        globalWatchlistStatus: globalWatchlistActive ? "ACTIVE" : null,
+        globalWatchlistCategory: globalWatchlistCategory ?? null,
+        globalWatchlistReason: globalWatchlistReason ?? null,
       },
       missingInputs,
       conflicts,
