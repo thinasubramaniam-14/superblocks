@@ -636,6 +636,45 @@ export default api({
         legalEntityId = wlCle;
       }
     }
+    // Fallback: try getLegalEntityBriefByAccountId (works for accounts where
+    // getLegalEntityIdByAccountId returns NOT_FOUND)
+    if (!legalEntityId) {
+      try {
+        const briefResult = await ctx.integrations.risk_common_bff.query(
+          `query {
+            getLegalEntityBriefByAccountId(accountId: "${accountId}") {
+              id
+              owningEntity
+              status
+            }
+          }`,
+          {
+            response: z.object({
+              data: z
+                .object({
+                  getLegalEntityBriefByAccountId: z
+                    .object({
+                      id: z.string().nullable().optional(),
+                      owningEntity: z.string().nullable().optional(),
+                      status: z.string().nullable().optional(),
+                    })
+                    .nullable(),
+                })
+                .nullable(),
+            }),
+          },
+          {},
+          { label: "Resolve legalEntityId via CLE brief fallback" },
+          graphqlHeaders,
+        );
+        const briefId = briefResult?.data?.getLegalEntityBriefByAccountId?.id;
+        if (typeof briefId === "string" && briefId.length > 0) {
+          legalEntityId = briefId;
+        }
+      } catch {
+        // CLE brief fallback failed — continue without legalEntityId
+      }
+    }
 
     // ====================================================================
     // PHASE 2: legalEntityId-dependent queries (parallel)
@@ -1009,60 +1048,12 @@ export default api({
           ),
         ),
 
-        // G. Issuing-specific realtime TM cases via compliance-graphql
-        safeQuery(() => {
-          const now = new Date();
-          const twoYearsAgo = new Date(now);
-          twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
-          const fmtDate = (d: Date) => d.toISOString().split("T")[0];
-          return ctx.integrations.compliance_graphql.query(
-            `query {
-              getRealtimeCaseList(request: {
-                clientLegalEntityId: "${legalEntityId}",
-                transactionType: [ISSUING],
-                skip: 0,
-                limit: 20,
-                createTimeStart: "${fmtDate(twoYearsAgo)}",
-                createTimeEnd: "${fmtDate(now)}"
-              }) {
-                hasNext
-                total
-                data {
-                  id
-                  status
-                  clientLegalEntityId
-                }
-              }
-            }`,
-            {
-              response: z.object({
-                data: z
-                  .object({
-                    getRealtimeCaseList: z
-                      .object({
-                        hasNext: z.boolean().nullable().optional(),
-                        total: z.number().nullable().optional(),
-                        data: z
-                          .array(
-                            z.object({
-                              id: z.string().nullable().optional(),
-                              status: z.string().nullable().optional(),
-                              clientLegalEntityId: z.string().nullable().optional(),
-                            }),
-                          )
-                          .nullable()
-                          .optional(),
-                      })
-                      .nullable(),
-                  })
-                  .nullable(),
-              }),
-            },
-            {},
-            { label: "Get issuing-specific TM cases by legalEntityId" },
-            graphqlHeaders,
-          );
-        }),
+        // G. (Removed) Issuing-specific realtime TM query — TransactionType
+        // enum has no ISSUING/CARD value, so the filter was invalid and the
+        // query always silently failed.  Any issuing-related TM cases that
+        // exist in compliance-graphql will be captured by the general
+        // realtime TM query in step E.
+        Promise.resolve(null),
       ]);
 
       // Parse Phase 2 results
@@ -1093,13 +1084,8 @@ export default api({
           rfiSessionStatus: c.rfiSessionStatus ?? null,
         }),
       );
-      issuingTmCases = (issuingResult?.data?.getRealtimeCaseList?.data ?? []).map(
-        (c: { id?: string | null; status?: string | null; clientLegalEntityId?: string | null }) => ({
-          caseId: c.id ?? null,
-          status: c.status ?? null,
-          clientLegalEntityId: c.clientLegalEntityId ?? null,
-        }),
-      );
+      // issuingResult is null — issuing-specific query removed (invalid enum).
+      // issuingTmCases stays empty; any issuing cases are in realtimeTmCases.
     }
 
     // ====================================================================
