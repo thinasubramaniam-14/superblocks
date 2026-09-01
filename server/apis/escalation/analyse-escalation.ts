@@ -1170,8 +1170,170 @@ export default api({
       null;
 
     // ====================================================================
-    // ROUTING DECISION (Priority: PA Risk Ops > KYC > KYB > TM > CS)
+    // ROUTING DECISION (Priority: Global Watchlist > PA Risk Ops > KYC > KYB > TM > CS)
     // ====================================================================
+
+    // --- Watchlist category → CS playbook mapping ---
+    // IMPORTANT: Never use the word "watchlist" in customer-facing messages.
+    type WatchlistPlaybook = {
+      routing: RoutingCategory;
+      escalationPoint: string;
+      customerImpact: string;
+      suggestedAction: string;
+      customerMsg: string;
+    };
+
+    function getWatchlistPlaybook(
+      category: string | null,
+      reason: string | null,
+    ): WatchlistPlaybook {
+      const cat = (category ?? "").toLowerCase().trim();
+      const reasonStr = reason ?? "";
+
+      if (cat.includes("credit") || cat.includes("pa risk") || cat.includes("lending")) {
+        return {
+          routing: "PA Risk Ops",
+          escalationPoint: `Global watchlist: ${category}`,
+          customerImpact: `Payouts may be reviewed or blocked (${category}): ${reasonStr}`,
+          suggestedAction:
+            "1. Check KYB status\n" +
+            "2. Locate PA Termination Notice: Airboard → Utility → Email History → Search by Recipient (Primary Contact)\n" +
+            "3. If notice found → macro: Payments::PA Suspension (Suspension Notice Sent)\n" +
+            "4. If no notice → confirm added by PA Risk Ops (check 'Watchlist Last Updated by')\n" +
+            "   • Managed account → escalate to BD\n" +
+            "   • Self-serve → Raise Jira: https://airwallex.atlassian.net/servicedesk/customer/portal/111/group/297\n" +
+            "   • Use 'Inquiries on PA clients status' if no termination notice found\n" +
+            "   • For appeals → 'Appeal/Follow up on KYB Case Rejection'",
+          customerMsg:
+            "We're reviewing your account. Our team will be in touch with any updates or next steps.",
+        };
+      }
+
+      if (cat.includes("fraud") || cat.includes("frozen")) {
+        return {
+          routing: "PA Risk Ops",
+          escalationPoint: `Global watchlist: ${category}`,
+          customerImpact: `All account activity blocked (${category}): ${reasonStr}`,
+          suggestedAction:
+            "1. Locate Suspension Notice: Airboard → Utility → Email History → Search by Recipient (Primary Contact)\n" +
+            "2. If notice found → macro: Account suspension - Email Sent\n" +
+            "3. If no notice → macro: Account suspension response, then notify TM via CS Ops Escalations (Non FinOps)\n" +
+            "   (No further action needed — relevant team will contact customer)",
+          customerMsg:
+            "Your account is currently under review. Our team will reach out to you directly with further information.",
+        };
+      }
+
+      if (cat.includes("rfi") || cat.includes("non-responsive") || cat.includes("nonresponsive")) {
+        return {
+          routing: "KYC",
+          escalationPoint: `Global watchlist: ${category}`,
+          customerImpact: `Payouts blocked; deposits and issuing may continue (${category}): ${reasonStr}`,
+          suggestedAction:
+            "1. Locate the RFI in Airboard:\n" +
+            "   • TM: Airboard > Risk > Investigation Inquiry\n" +
+            "   • NS: Airboard > Risk > Namescreening\n" +
+            "   • KYC: Airboard > Legal Entity > KYC Cases\n" +
+            "2. Check Utilities > Email History for when the RFI was sent\n" +
+            "3. If customer has NOT responded → macro: Watchlist:: Client Is Non-Responsive (RFI Sent)\n" +
+            "4. If customer HAS responded → macro: Watchlist:: Client Is Non-Responsive (RFI responded to, escalation macro)\n" +
+            "   Escalate to team of the 'Last Updated by' field",
+          customerMsg:
+            "We sent a verification request that requires your response. Please check your email for details and respond at your earliest convenience so we can resolve this.",
+        };
+      }
+
+      if (cat.includes("negative balance")) {
+        return {
+          routing: "PA Risk Ops",
+          escalationPoint: `Global watchlist: ${category}`,
+          customerImpact: `Payouts blocked due to negative balance: ${reasonStr}`,
+          suggestedAction:
+            "1. Check whether the negative balance is still outstanding\n" +
+            "2. If still negative → macro: Customer on WL due to Negative Balance\n" +
+            "3. If cleared → watchlist auto-removes next day. To expedite, raise Jira to PA Team (HKSEA → local CS)",
+          customerMsg:
+            "There is an outstanding balance on your account that needs to be resolved. Once cleared, normal service will resume.",
+        };
+      }
+
+      if (cat.includes("sanctions")) {
+        return {
+          routing: "PA Risk Ops",
+          escalationPoint: `Global watchlist: ${category}`,
+          customerImpact: `Payouts may be reviewed or blocked (${category}): ${reasonStr}`,
+          suggestedAction:
+            "Escalate to Name Screening team.\n" +
+            "Macro: Watchlist:: Account in Sanctions Concern Watchlist",
+          customerMsg:
+            "Your account is currently under review by our compliance team. We will follow up with you shortly.",
+        };
+      }
+
+      if (cat.includes("monitoring")) {
+        return {
+          routing: "TM",
+          escalationPoint: `Global watchlist: ${category}`,
+          customerImpact: `Transactions under review by TM (customer is NOT informed of restrictions): ${reasonStr}`,
+          suggestedAction:
+            "DO NOT inform the customer of any restrictions or reviews.\n" +
+            "No further action typically needed — customer can transact as usual.\n" +
+            "If inquiry is about payout/deposit, follow standard Payout/Deposit Investigation Steps.",
+          customerMsg:
+            "Everything looks fine on our end. Please proceed with your transactions as usual. If you experience any issues, let us know.",
+        };
+      }
+
+      if (cat.includes("offboarding") || cat.includes("finalize")) {
+        return {
+          routing: "CS",
+          escalationPoint: `Global watchlist: ${category}`,
+          customerImpact: `Customer is being offboarded; balance payout may be reviewed: ${reasonStr}`,
+          suggestedAction:
+            "1. Locate Notice of Termination: Airboard Utilities > Email History + search Zendesk by business name\n" +
+            "2. If customer received notice and pushes back → macro: AWX Driven Offboarding - Pushback\n" +
+            "3. If continues pushback or no notice sent → escalate to local CS",
+          customerMsg:
+            "Our records show your account closure is in progress. If you have questions about the process, we're here to help.",
+        };
+      }
+
+      if (cat.includes("transaction freeze")) {
+        return {
+          routing: "CS",
+          escalationPoint: `Global watchlist: ${category}`,
+          customerImpact: `Account frozen due to external-party request: ${reasonStr}`,
+          suggestedAction: "Raise to Local CS.",
+          customerMsg:
+            "Your account is currently under a temporary hold. Our team is looking into this and will update you as soon as possible.",
+        };
+      }
+
+      if (cat.includes("high risk") || cat.includes("new onboarded")) {
+        return {
+          routing: "CS",
+          escalationPoint: `Global watchlist: ${category}`,
+          customerImpact: `Account usage blocked (newly onboarded high risk): ${reasonStr}`,
+          suggestedAction:
+            "1. Raise to Local CS\n" +
+            "2. Local CS to raise with Risk Support on Slack #risk-support",
+          customerMsg:
+            "Your account is being reviewed as part of our onboarding process. We'll update you once the review is complete.",
+        };
+      }
+
+      // Fallback for unrecognised categories
+      return {
+        routing: "PA Risk Ops",
+        escalationPoint: `Global watchlist: ${category ?? "Unknown"}`,
+        customerImpact: `Account on global watchlist (${category ?? "Unknown"}): ${reasonStr}`,
+        suggestedAction:
+          "Raise Jira ticket at https://airwallex.atlassian.net/servicedesk/customer/portal/111/group/297",
+        customerMsg:
+          "Your account is currently under review. Our team will be in touch with any updates.",
+      };
+    }
+    // --- End playbook mapping ---
 
     const missingInputs: string[] = [];
     const conflicts: string[] = [];
@@ -1181,14 +1343,33 @@ export default api({
     let currentStatus: string;
     let whatIsOutstanding: string;
     let suggestedInternalAction: string;
+    let customerMessageOverride: string | null = null;
 
-    // ----- PA Risk Ops (highest priority) -----
+    // ----- Global Watchlist (highest priority — category-specific playbook) -----
     if (
+      globalWatchlistActive &&
+      paCases.length === 0 &&
+      !hasWatchlistPaSignal &&
+      nsWithPaSignal.length === 0 &&
+      universalPaCases.length === 0
+    ) {
+      // Pure global watchlist trigger — use category-specific playbook
+      const playbook = getWatchlistPlaybook(globalWatchlistCategory, globalWatchlistReason);
+      routingCategory = playbook.routing;
+      escalationPoint = playbook.escalationPoint;
+      currentStatus = `Global watchlist: ${globalWatchlistCategory ?? "Unknown"} — ${globalWatchlistReason ?? "no reason given"}`;
+      whatIsOutstanding = playbook.customerImpact;
+      suggestedInternalAction = playbook.suggestedAction;
+      // Override customer message after the routing block
+      customerMessageOverride = playbook.customerMsg;
+    }
+
+    // ----- PA Risk Ops (other PA signals, may combine with watchlist) -----
+    else if (
       paCases.length > 0 ||
       hasWatchlistPaSignal ||
       nsWithPaSignal.length > 0 ||
-      universalPaCases.length > 0 ||
-      globalWatchlistActive
+      universalPaCases.length > 0
     ) {
       routingCategory = "PA Risk Ops";
 
@@ -1403,7 +1584,9 @@ export default api({
     // ====================================================================
 
     let customerMessage = RFI_MESSAGES[rfiStatus];
-    if (routingCategory === "TM" && rfiStatus === "None") {
+    if (customerMessageOverride) {
+      customerMessage = customerMessageOverride;
+    } else if (routingCategory === "TM" && rfiStatus === "None") {
       customerMessage =
         "No open verification request is showing. The relevant team will check the current transaction status.";
     } else if (routingCategory === "CS") {
