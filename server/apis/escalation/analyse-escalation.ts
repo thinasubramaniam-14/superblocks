@@ -55,6 +55,8 @@ const RecommendationSchema = z.object({
     kybCaseStatus: z.string().nullable(),
     nsCasesSummary: z.string().nullable(),
     realtimeTmSummary: z.string().nullable(),
+    mrmCaseSummary: z.string().nullable(),
+    issuingTmSummary: z.string().nullable(),
     // Global watchlist fields
     globalWatchlistStatus: z.string().nullable(),
     globalWatchlistCategory: z.string().nullable(),
@@ -676,6 +678,18 @@ export default api({
       caseType?: string | null;
       clientLegalEntityId?: string | null;
     }> = [];
+    let mrmCases: Array<{
+      id?: string | null;
+      caseKind?: string | null;
+      reviewState?: string | null;
+      owningEntity?: string | null;
+      rfiSessionStatus?: string | null;
+    }> = [];
+    let issuingTmCases: Array<{
+      caseId?: string | null;
+      status?: string | null;
+      clientLegalEntityId?: string | null;
+    }> = [];
 
     if (legalEntityId) {
       const [
@@ -684,6 +698,8 @@ export default api({
         kybOngoingResult,
         nsResult,
         realtimeResult,
+        mrmResult,
+        issuingResult,
       ] = await Promise.all([
         // A. Universal Case List via risk-common-bff
         safeQuery(() =>
@@ -932,6 +948,121 @@ export default api({
             graphqlHeaders,
           );
         }),
+
+        // F. Post-monitoring MRM/CLE cases via postmonitoring-graphql
+        safeQuery(() =>
+          ctx.integrations.postmonitoring_graphql.query(
+            `query {
+              mrmListCases(query: {
+                entity: { legalEntityId: "${legalEntityId}" },
+                state: OPEN,
+                pagination: { pageNumber: 0, pageSize: 10 }
+              }) {
+                total
+                cases {
+                  id
+                  caseKind
+                  reviewStatus { state }
+                  entity { owningEntity }
+                  rfiSessionStatus
+                }
+              }
+            }`,
+            {
+              response: z.object({
+                data: z
+                  .object({
+                    mrmListCases: z
+                      .object({
+                        total: z.number().nullable().optional(),
+                        cases: z
+                          .array(
+                            z.object({
+                              id: z.string().nullable().optional(),
+                              caseKind: z.string().nullable().optional(),
+                              reviewStatus: z
+                                .object({
+                                  state: z.string().nullable().optional(),
+                                })
+                                .nullable()
+                                .optional(),
+                              entity: z
+                                .object({
+                                  owningEntity: z.string().nullable().optional(),
+                                })
+                                .nullable()
+                                .optional(),
+                              rfiSessionStatus: z.string().nullable().optional(),
+                            }),
+                          )
+                          .nullable()
+                          .optional(),
+                      })
+                      .nullable(),
+                  })
+                  .nullable(),
+              }),
+            },
+            {},
+            { label: "List MRM/CLE post-monitoring cases" },
+            graphqlHeaders,
+          ),
+        ),
+
+        // G. Issuing-specific realtime TM cases via compliance-graphql
+        safeQuery(() => {
+          const now = new Date();
+          const twoYearsAgo = new Date(now);
+          twoYearsAgo.setFullYear(twoYearsAgo.getFullYear() - 2);
+          const fmtDate = (d: Date) => d.toISOString().split("T")[0];
+          return ctx.integrations.compliance_graphql.query(
+            `query {
+              getRealtimeCaseList(request: {
+                clientLegalEntityId: "${legalEntityId}",
+                transactionType: [ISSUING],
+                skip: 0,
+                limit: 20,
+                createTimeStart: "${fmtDate(twoYearsAgo)}",
+                createTimeEnd: "${fmtDate(now)}"
+              }) {
+                hasNext
+                total
+                data {
+                  id
+                  status
+                  clientLegalEntityId
+                }
+              }
+            }`,
+            {
+              response: z.object({
+                data: z
+                  .object({
+                    getRealtimeCaseList: z
+                      .object({
+                        hasNext: z.boolean().nullable().optional(),
+                        total: z.number().nullable().optional(),
+                        data: z
+                          .array(
+                            z.object({
+                              id: z.string().nullable().optional(),
+                              status: z.string().nullable().optional(),
+                              clientLegalEntityId: z.string().nullable().optional(),
+                            }),
+                          )
+                          .nullable()
+                          .optional(),
+                      })
+                      .nullable(),
+                  })
+                  .nullable(),
+              }),
+            },
+            {},
+            { label: "Get issuing-specific TM cases by legalEntityId" },
+            graphqlHeaders,
+          );
+        }),
       ]);
 
       // Parse Phase 2 results
@@ -944,6 +1075,28 @@ export default api({
           caseId: c.id ?? null,
           status: c.status ?? null,
           caseType: null as string | null,
+          clientLegalEntityId: c.clientLegalEntityId ?? null,
+        }),
+      );
+      mrmCases = (mrmResult?.data?.mrmListCases?.cases ?? []).map(
+        (c: {
+          id?: string | null;
+          caseKind?: string | null;
+          reviewStatus?: { state?: string | null } | null;
+          entity?: { owningEntity?: string | null } | null;
+          rfiSessionStatus?: string | null;
+        }) => ({
+          id: c.id ?? null,
+          caseKind: c.caseKind ?? null,
+          reviewState: c.reviewStatus?.state ?? null,
+          owningEntity: c.entity?.owningEntity ?? null,
+          rfiSessionStatus: c.rfiSessionStatus ?? null,
+        }),
+      );
+      issuingTmCases = (issuingResult?.data?.getRealtimeCaseList?.data ?? []).map(
+        (c: { id?: string | null; status?: string | null; clientLegalEntityId?: string | null }) => ({
+          caseId: c.id ?? null,
+          status: c.status ?? null,
           clientLegalEntityId: c.clientLegalEntityId ?? null,
         }),
       );
@@ -967,6 +1120,8 @@ export default api({
       kybOngoingCases.length > 0 ||
       nsCases.length > 0 ||
       realtimeTmCases.length > 0 ||
+      mrmCases.length > 0 ||
+      issuingTmCases.length > 0 ||
       globalWatchlistActive;
 
     if (!anyDataFound) {
@@ -1034,6 +1189,14 @@ export default api({
     // --- Active realtime TM cases ---
     const activeRealtimeTm = realtimeTmCases.filter((c) => isActive(c.status));
 
+    // --- Active MRM/CLE post-monitoring cases ---
+    const activeMrmCases = mrmCases.filter(
+      (c) => c.reviewState?.toUpperCase() !== "CLOSED" && c.reviewState?.toUpperCase() !== "RESOLVED",
+    );
+
+    // --- Active issuing-specific TM cases ---
+    const activeIssuingTm = issuingTmCases.filter((c) => isActive(c.status));
+
     // --- Universal cases classified by type ---
     const activeUniversalCases = universalCases.filter((c) => isActive(c.caseStatus));
     const universalKycCases = activeUniversalCases.filter(
@@ -1092,6 +1255,8 @@ export default api({
       allActiveKyb.length > 0 ||
       activeNsCases.length > 0 ||
       activeRealtimeTm.length > 0 ||
+      activeMrmCases.length > 0 ||
+      activeIssuingTm.length > 0 ||
       globalWatchlistActive;
 
     // ====================================================================
@@ -1103,6 +1268,7 @@ export default api({
       issuingAccount?.awxOwningEntity ??
       (kycCases.length > 0 ? kycCases[0].owningEntity : null) ??
       (activeNsCases.length > 0 ? activeNsCases[0].owningEntity : null) ??
+      (activeMrmCases.length > 0 ? activeMrmCases[0].owningEntity : null) ??
       null;
     const region = accountInfo?.dataCenter ?? null;
 
@@ -1118,6 +1284,10 @@ export default api({
     // Also include NS case RFI status
     const nsRfiStatuses = activeNsCases
       .filter((c) => c.rfi === true)
+      .map((c) => c.rfiSessionStatus)
+      .filter(Boolean);
+    // Include MRM case RFI session status
+    const mrmRfiStatuses = activeMrmCases
       .map((c) => c.rfiSessionStatus)
       .filter(Boolean);
 
@@ -1144,8 +1314,14 @@ export default api({
         s?.toUpperCase().includes("OPEN") ||
         s?.toUpperCase().includes("PENDING"),
     );
+    const hasMrmOpenRfi = mrmRfiStatuses.some(
+      (s) =>
+        s?.toUpperCase().includes("OPEN") ||
+        s?.toUpperCase().includes("PENDING") ||
+        s?.toUpperCase().includes("SENT"),
+    );
 
-    if (hasPendingRfi || hasKycOpenRfi || hasNsOpenRfi) {
+    if (hasPendingRfi || hasKycOpenRfi || hasNsOpenRfi || hasMrmOpenRfi) {
       rfiStatus = "Open";
     } else if (hasAnsweredRfi || hasClosedRfi || hasKycClosedRfi) {
       rfiStatus = "Closed";
@@ -1431,6 +1607,17 @@ export default api({
         : "Escalate to PA Risk Ops queue. Do not route to KYC.";
     }
 
+    // ----- MRM / Post-Monitoring CLE cases → PA Risk Ops -----
+    else if (activeMrmCases.length > 0) {
+      routingCategory = "PA Risk Ops";
+      escalationPoint = `Post-monitoring review active (${activeMrmCases.length} case(s))`;
+      currentStatus = `${activeMrmCases.length} active post-monitoring case(s) — review state: ${activeMrmCases[0].reviewState ?? "Open"}`;
+      whatIsOutstanding =
+        "Active post-monitoring review in progress. Account under enhanced scrutiny.";
+      suggestedInternalAction =
+        `Post-monitoring case detected. Escalate to PA Risk Ops${owningEntity ? ` (${owningEntity})` : ""}. Do not route to KYC or TM.`;
+    }
+
     // ----- KYC -----
     else if (
       activeKycCases.length > 0 ||
@@ -1492,6 +1679,7 @@ export default api({
     else if (
       activeTmCases.length > 0 ||
       activeRealtimeTm.length > 0 ||
+      activeIssuingTm.length > 0 ||
       universalTmCases.length > 0 ||
       nsWithTmSignal.length > 0 ||
       input.transactionId ||
@@ -1509,6 +1697,9 @@ export default api({
       if (activeRealtimeTm.length > 0) {
         tmSignals.push(`${activeRealtimeTm.length} realtime case(s)`);
       }
+      if (activeIssuingTm.length > 0) {
+        tmSignals.push(`${activeIssuingTm.length} issuing/card risk case(s)`);
+      }
       if (universalTmCases.length > 0) {
         tmSignals.push(`${universalTmCases.length} universal TM case(s)`);
       }
@@ -1524,6 +1715,8 @@ export default api({
         escalationPoint = "Payout in review";
       } else if (input.transactionId) {
         escalationPoint = "Transaction in review";
+      } else if (activeIssuingTm.length > 0) {
+        escalationPoint = "Issuing/card risk case active";
       } else if (activeRealtimeTm.length > 0) {
         escalationPoint = "Realtime TM case active";
       } else {
@@ -1659,6 +1852,16 @@ export default api({
         ? `${activeRealtimeTm.length} active realtime TM case(s)`
         : null;
 
+    const mrmCaseSummary =
+      activeMrmCases.length > 0
+        ? `${activeMrmCases.length} active post-monitoring case(s) — state: ${activeMrmCases[0].reviewState ?? "Open"}${activeMrmCases.some((c) => c.rfiSessionStatus) ? " | RFI: " + activeMrmCases.filter((c) => c.rfiSessionStatus).map((c) => c.rfiSessionStatus).join(", ") : ""}`
+        : null;
+
+    const issuingTmSummary =
+      activeIssuingTm.length > 0
+        ? `${activeIssuingTm.length} active issuing/card risk case(s)`
+        : null;
+
     // ====================================================================
     // BUILD RECOMMENDATION
     // ====================================================================
@@ -1698,6 +1901,8 @@ export default api({
         kybCaseStatus,
         nsCasesSummary,
         realtimeTmSummary,
+        mrmCaseSummary,
+        issuingTmSummary,
         // Global watchlist fields
         globalWatchlistStatus: globalWatchlistActive ? "ACTIVE" : null,
         globalWatchlistCategory: globalWatchlistCategory ?? null,

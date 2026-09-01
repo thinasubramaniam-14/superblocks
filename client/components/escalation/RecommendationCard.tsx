@@ -19,6 +19,8 @@ interface SupportingInfo {
   kybCaseStatus: string | null;
   nsCasesSummary: string | null;
   realtimeTmSummary: string | null;
+  mrmCaseSummary: string | null;
+  issuingTmSummary: string | null;
   globalWatchlistStatus: string | null;
   globalWatchlistCategory: string | null;
   globalWatchlistReason: string | null;
@@ -234,6 +236,14 @@ export default function RecommendationCard({
             <InfoRow
               label="Realtime TM"
               value={supportingInfo.realtimeTmSummary}
+            />
+            <InfoRow
+              label="Post-Monitoring (MRM)"
+              value={supportingInfo.mrmCaseSummary}
+            />
+            <InfoRow
+              label="Issuing/Card Risk"
+              value={supportingInfo.issuingTmSummary}
             />
             {supportingInfo.globalWatchlistStatus && (
               <>

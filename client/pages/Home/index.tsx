@@ -39,6 +39,8 @@ interface Recommendation {
     kybCaseStatus: string | null;
     nsCasesSummary: string | null;
     realtimeTmSummary: string | null;
+    mrmCaseSummary: string | null;
+    issuingTmSummary: string | null;
     globalWatchlistStatus: string | null;
     globalWatchlistCategory: string | null;
     globalWatchlistReason: string | null;
