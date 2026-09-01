@@ -14,6 +14,11 @@ interface SupportingInfo {
   watchlistSource: string | null;
   owningEntity: string | null;
   region: string | null;
+  legalEntityId: string | null;
+  universalCaseSummary: string | null;
+  kybCaseStatus: string | null;
+  nsCasesSummary: string | null;
+  realtimeTmSummary: string | null;
 }
 
 interface Recommendation {
@@ -35,6 +40,7 @@ interface RecommendationCardProps {
 
 const TEAM_STYLES: Record<string, string> = {
   KYC: "bg-[#dbeafe] text-[#1e40af] border-[#93c5fd]",
+  KYB: "bg-[#e0f2fe] text-[#0369a1] border-[#7dd3fc]",
   TM: "bg-[#ede9fe] text-[#5b21b6] border-[#c4b5fd]",
   PA: "bg-[#fff1e6] text-[#c2410c] border-[#fdba74]",
 };
@@ -206,6 +212,26 @@ export default function RecommendationCard({
               value={supportingInfo.owningEntity}
             />
             <InfoRow label="Region" value={supportingInfo.region} />
+            <InfoRow
+              label="Legal Entity ID"
+              value={supportingInfo.legalEntityId}
+            />
+            <InfoRow
+              label="Universal Cases"
+              value={supportingInfo.universalCaseSummary}
+            />
+            <InfoRow
+              label="KYB Status"
+              value={supportingInfo.kybCaseStatus}
+            />
+            <InfoRow
+              label="NS/Watchlist Cases"
+              value={supportingInfo.nsCasesSummary}
+            />
+            <InfoRow
+              label="Realtime TM"
+              value={supportingInfo.realtimeTmSummary}
+            />
           </div>
         )}
       </div>

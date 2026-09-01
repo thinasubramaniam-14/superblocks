@@ -15,8 +15,8 @@ const ISS_AIRBOARDNG_API = "90aed8ed-3f3f-47e8-9ac0-608f2f66a2c0";
 const AIRBOARDNG_API = "29d50385-2822-4444-a83e-83db2519a0e6";
 const ACCOUNT_SETTINGS = "25c0f7da-e324-4125-bdd9-4ce506dcac32";
 
-// --- Routing categories ---
-type RoutingCategory = "KYC" | "TM" | "PA Risk Ops" | "CS";
+// --- Routing categories (KYB added) ---
+type RoutingCategory = "KYC" | "KYB" | "TM" | "PA Risk Ops" | "CS";
 type RfiStatus = "Open" | "Closed" | "None";
 
 // --- RFI customer messages ---
@@ -49,6 +49,12 @@ const RecommendationSchema = z.object({
     watchlistSource: z.string().nullable(),
     owningEntity: z.string().nullable(),
     region: z.string().nullable(),
+    // New fields from gap fix
+    legalEntityId: z.string().nullable(),
+    universalCaseSummary: z.string().nullable(),
+    kybCaseStatus: z.string().nullable(),
+    nsCasesSummary: z.string().nullable(),
+    realtimeTmSummary: z.string().nullable(),
   }),
   missingInputs: z.array(z.string()),
   conflicts: z.array(z.string()),
@@ -70,10 +76,26 @@ async function safeQuery<T>(
   }
 }
 
+// Closed/terminal status sets
+const CLOSED_STATUSES = new Set([
+  "CLOSED",
+  "COMPLETED",
+  "REJECTED",
+  "CANCELLED",
+  "RESOLVED",
+  "DISMISSED",
+  "ARCHIVED",
+]);
+
+function isActive(status: string | null | undefined): boolean {
+  if (!status) return false;
+  return !CLOSED_STATUSES.has(status.toUpperCase());
+}
+
 export default api({
   name: "AnalyseEscalation",
   description:
-    "Aggregates account, KYC, TM, card, and watchlist data to route CS escalations",
+    "Aggregates account, KYC, KYB, TM, PA, card, NS/watchlist and universal case data to route CS escalations",
 
   integrations: {
     risk_common_bff: graphql(RISK_COMMON_BFF),
@@ -105,10 +127,7 @@ export default api({
   async run(ctx, input) {
     const { accountId } = input;
 
-    // Derive auth headers per org knowledge:
-    // GraphQL integrations: raw token (no Bearer prefix)
-    // REST integrations (airboardng-api, iss-airboardng-api): Bearer prefix
-    // If airboardToken is absent (staging fallback), omit headers to fall back to integration defaults.
+    // Derive auth headers per org knowledge
     const graphqlHeaders = input.airboardToken
       ? { Authorization: input.airboardToken }
       : undefined;
@@ -120,8 +139,9 @@ export default api({
       return { recommendation: null, error: "Account ID is required." };
     }
 
-    // ------ Step 1: Query all services in parallel (Account ID-based) ------
-    // Do NOT gate on CLE/account-settings lookup — many services accept Account ID directly.
+    // ====================================================================
+    // PHASE 1: All accountId-based queries + Legal Entity ID resolution
+    // ====================================================================
 
     const [
       kycCasesResult,
@@ -132,8 +152,9 @@ export default api({
       cardholdersResult,
       issuingAccountResult,
       watchlistResult,
+      legalEntityResult,
     ] = await Promise.all([
-      // KYC cases via airboard-ng-kyc-service (direct Account ID)
+      // 1. KYC cases via airboard-ng-kyc-service
       safeQuery(() =>
         ctx.integrations.airboard_ng_kyc.query(
           `query {
@@ -188,7 +209,7 @@ export default api({
         ),
       ),
 
-      // TM cases via postmonitoring-graphql (direct Account ID via account.uuid)
+      // 2. TM cases via postmonitoring-graphql
       safeQuery(() =>
         ctx.integrations.postmonitoring_graphql.query(
           `query {
@@ -229,7 +250,7 @@ export default api({
         ),
       ),
 
-      // RFI sessions via compliance-graphql (direct Account ID)
+      // 3. RFI sessions via compliance-graphql
       safeQuery(() =>
         ctx.integrations.compliance_graphql.query(
           `query {
@@ -272,7 +293,7 @@ export default api({
         ),
       ),
 
-      // RFI list via compliance-graphql (direct Account ID)
+      // 4. RFI list via compliance-graphql
       safeQuery(() =>
         ctx.integrations.compliance_graphql.query(
           `query {
@@ -315,7 +336,7 @@ export default api({
         ),
       ),
 
-      // Account info via account-settings-airboard
+      // 5. Account info via account-settings-airboard
       safeQuery(() =>
         ctx.integrations.account_settings.query(
           `query {
@@ -350,7 +371,7 @@ export default api({
         ),
       ),
 
-      // Cardholders via iss-airboardng-api (direct Account ID)
+      // 6. Cardholders via iss-airboardng-api
       safeQuery(() =>
         ctx.integrations.iss_airboardng_api.query(
           `query {
@@ -393,7 +414,7 @@ export default api({
         ),
       ),
 
-      // Issuing account details via iss-airboardng-api
+      // 7. Issuing account details via iss-airboardng-api
       safeQuery(() =>
         ctx.integrations.iss_airboardng_api.query(
           `query {
@@ -426,7 +447,7 @@ export default api({
         ),
       ),
 
-      // Watchlist data via risk-common-bff (Account Linkage V3)
+      // 8. Watchlist data via risk-common-bff (Account Linkage V3)
       safeQuery(() =>
         ctx.integrations.risk_common_bff.query(
           `query {
@@ -481,9 +502,32 @@ export default api({
           graphqlHeaders,
         ),
       ),
+
+      // 9. NEW: Resolve Legal Entity ID (unless CLE provided in input)
+      input.cle
+        ? Promise.resolve(input.cle)
+        : safeQuery(() =>
+            ctx.integrations.risk_common_bff.query(
+              `query {
+                getLegalEntityIdByAccountId(accountId: "${accountId}")
+              }`,
+              {
+                response: z.object({
+                  data: z
+                    .object({
+                      getLegalEntityIdByAccountId: z.string().nullable(),
+                    })
+                    .nullable(),
+                }),
+              },
+              {},
+              { label: "Resolve legalEntityId from accountId" },
+              graphqlHeaders,
+            ),
+          ),
     ]);
 
-    // ------ Step 2: Parse results ------
+    // ------ Parse Phase 1 results ------
     const kycCases =
       kycCasesResult?.data?.getKycCases?.kycCaseEntries ?? [];
     const tmCases =
@@ -506,7 +550,311 @@ export default api({
         (a: { watchlistHit?: boolean | null }) => a.watchlistHit === true,
       );
 
-    // Determine if ANY service returned data — soft validation
+    // Resolve legalEntityId: input.cle > API result > KYC case fallback
+    let legalEntityId: string | null = null;
+    if (typeof legalEntityResult === "string") {
+      // input.cle was provided
+      legalEntityId = legalEntityResult;
+    } else if (legalEntityResult && typeof legalEntityResult === "object") {
+      legalEntityId =
+        (legalEntityResult as { data?: { getLegalEntityIdByAccountId?: string | null } })
+          ?.data?.getLegalEntityIdByAccountId ?? null;
+    }
+    // Fallback: extract from the first KYC case
+    if (!legalEntityId && kycCases.length > 0) {
+      legalEntityId = kycCases[0].legalEntityId ?? null;
+    }
+    // Fallback: extract from RFI sessions
+    if (!legalEntityId && rfiSessions.length > 0) {
+      legalEntityId = rfiSessions[0].clientLegalEntityId ?? null;
+    }
+
+    // ====================================================================
+    // PHASE 2: legalEntityId-dependent queries (parallel)
+    // Only run if legalEntityId was resolved.
+    // ====================================================================
+
+    let universalCases: Array<{
+      caseId?: string | null;
+      caseType?: string | null;
+      caseStatus?: string | null;
+      owningEntity?: string | null;
+      domains?: string[] | null;
+    }> = [];
+    let kybCases: Array<{
+      caseId?: string | null;
+      status?: string | null;
+      caseType?: string | null;
+    }> = [];
+    let kybOngoingCases: Array<{
+      caseId?: string | null;
+      status?: string | null;
+      reviewType?: string | null;
+    }> = [];
+    let nsCases: Array<{
+      uuid?: string | null;
+      accountId?: string | null;
+      legalEntityId?: string | null;
+      status?: string | null;
+      categories?: string[] | null;
+      screeningType?: string | null;
+      archived?: boolean | null;
+      rfi?: boolean | null;
+      rfiSessionStatus?: string | null;
+      owningEntity?: string | null;
+      level?: string | null;
+    }> = [];
+    let realtimeTmCases: Array<{
+      caseId?: string | null;
+      status?: string | null;
+      caseType?: string | null;
+      clientLegalEntityId?: string | null;
+    }> = [];
+
+    if (legalEntityId) {
+      const [
+        universalResult,
+        kybResult,
+        kybOngoingResult,
+        nsResult,
+        realtimeResult,
+      ] = await Promise.all([
+        // A. Universal Case List via risk-common-bff
+        safeQuery(() =>
+          ctx.integrations.risk_common_bff.query(
+            `query {
+              getUniversalCaseList(legalEntityId: "${legalEntityId}") {
+                caseId
+                caseType
+                caseStatus
+                owningEntity
+                domains
+              }
+            }`,
+            {
+              response: z.object({
+                data: z
+                  .object({
+                    getUniversalCaseList: z
+                      .array(
+                        z.object({
+                          caseId: z.string().nullable().optional(),
+                          caseType: z.string().nullable().optional(),
+                          caseStatus: z.string().nullable().optional(),
+                          owningEntity: z.string().nullable().optional(),
+                          domains: z.array(z.string()).nullable().optional(),
+                        }),
+                      )
+                      .nullable(),
+                  })
+                  .nullable(),
+              }),
+            },
+            {},
+            { label: "Get universal case list by legalEntityId" },
+            graphqlHeaders,
+          ),
+        ),
+
+        // B. KYB cases via risk-kyb-airboard (getCaseList)
+        safeQuery(() =>
+          ctx.integrations.risk_kyb_airboard.query(
+            `query {
+              getCaseList(param: { account: "${accountId}", page: 0, size: 20 }) {
+                total
+                caseListDtos {
+                  caseId
+                  status
+                  caseType
+                }
+              }
+            }`,
+            {
+              response: z.object({
+                data: z
+                  .object({
+                    getCaseList: z
+                      .object({
+                        total: z.number().nullable().optional(),
+                        caseListDtos: z
+                          .array(
+                            z.object({
+                              caseId: z.string().nullable().optional(),
+                              status: z.string().nullable().optional(),
+                              caseType: z.string().nullable().optional(),
+                            }),
+                          )
+                          .nullable()
+                          .optional(),
+                      })
+                      .nullable(),
+                  })
+                  .nullable(),
+              }),
+            },
+            {},
+            { label: "Get KYB cases by account" },
+            graphqlHeaders,
+          ),
+        ),
+
+        // C. KYB ongoing cases via risk-kyb-airboard (getOngoingCaseListV2)
+        safeQuery(() =>
+          ctx.integrations.risk_kyb_airboard.query(
+            `query {
+              getOngoingCaseListV2(param: { account: "${accountId}", page: 0, size: 20 }) {
+                total
+                caseListDtos {
+                  caseId
+                  status
+                  reviewType
+                }
+              }
+            }`,
+            {
+              response: z.object({
+                data: z
+                  .object({
+                    getOngoingCaseListV2: z
+                      .object({
+                        total: z.number().nullable().optional(),
+                        caseListDtos: z
+                          .array(
+                            z.object({
+                              caseId: z.string().nullable().optional(),
+                              status: z.string().nullable().optional(),
+                              reviewType: z.string().nullable().optional(),
+                            }),
+                          )
+                          .nullable()
+                          .optional(),
+                      })
+                      .nullable(),
+                  })
+                  .nullable(),
+              }),
+            },
+            {},
+            { label: "Get KYB ongoing cases by account" },
+            graphqlHeaders,
+          ),
+        ),
+
+        // D. NS/Watchlist cases via postmonitoring-graphql (nsListCases)
+        safeQuery(() =>
+          ctx.integrations.postmonitoring_graphql.query(
+            `query {
+              nsListCases(query: { accountId: "${accountId}", legalEntityId: "${legalEntityId}", pageNum: 1, pageSize: 20 }) {
+                total
+                cases {
+                  uuid
+                  accountId
+                  legalEntityId
+                  status
+                  categories
+                  screeningType
+                  archived
+                  rfi
+                  rfiSessionStatus
+                  owningEntity
+                  level
+                }
+              }
+            }`,
+            {
+              response: z.object({
+                data: z
+                  .object({
+                    nsListCases: z
+                      .object({
+                        total: z.number().nullable().optional(),
+                        cases: z
+                          .array(
+                            z.object({
+                              uuid: z.string().nullable().optional(),
+                              accountId: z.string().nullable().optional(),
+                              legalEntityId: z.string().nullable().optional(),
+                              status: z.string().nullable().optional(),
+                              categories: z.array(z.string()).nullable().optional(),
+                              screeningType: z.string().nullable().optional(),
+                              archived: z.boolean().nullable().optional(),
+                              rfi: z.boolean().nullable().optional(),
+                              rfiSessionStatus: z.string().nullable().optional(),
+                              owningEntity: z.string().nullable().optional(),
+                              level: z.string().nullable().optional(),
+                            }),
+                          )
+                          .nullable()
+                          .optional(),
+                      })
+                      .nullable(),
+                  })
+                  .nullable(),
+              }),
+            },
+            {},
+            { label: "List NS/watchlist cases" },
+            graphqlHeaders,
+          ),
+        ),
+
+        // E. Realtime TM cases via compliance-graphql
+        safeQuery(() =>
+          ctx.integrations.compliance_graphql.query(
+            `query {
+              getRealtimeCaseList(request: { clientLegalEntityId: "${legalEntityId}", page: 0, size: 20 }) {
+                hasNext
+                values {
+                  caseId
+                  status
+                  caseType
+                  clientLegalEntityId
+                }
+              }
+            }`,
+            {
+              response: z.object({
+                data: z
+                  .object({
+                    getRealtimeCaseList: z
+                      .object({
+                        hasNext: z.boolean().nullable().optional(),
+                        values: z
+                          .array(
+                            z.object({
+                              caseId: z.string().nullable().optional(),
+                              status: z.string().nullable().optional(),
+                              caseType: z.string().nullable().optional(),
+                              clientLegalEntityId: z.string().nullable().optional(),
+                            }),
+                          )
+                          .nullable()
+                          .optional(),
+                      })
+                      .nullable(),
+                  })
+                  .nullable(),
+              }),
+            },
+            {},
+            { label: "Get realtime TM cases by legalEntityId" },
+            graphqlHeaders,
+          ),
+        ),
+      ]);
+
+      // Parse Phase 2 results
+      universalCases = universalResult?.data?.getUniversalCaseList ?? [];
+      kybCases = kybResult?.data?.getCaseList?.caseListDtos ?? [];
+      kybOngoingCases = kybOngoingResult?.data?.getOngoingCaseListV2?.caseListDtos ?? [];
+      nsCases = nsResult?.data?.nsListCases?.cases ?? [];
+      realtimeTmCases = realtimeResult?.data?.getRealtimeCaseList?.values ?? [];
+    }
+
+    // ====================================================================
+    // DETERMINE DATA PRESENCE
+    // ====================================================================
+
     const anyDataFound =
       kycCases.length > 0 ||
       tmCases.length > 0 ||
@@ -515,7 +863,12 @@ export default api({
       accountInfo !== null ||
       cardholders.length > 0 ||
       issuingAccount !== null ||
-      watchlistData !== null;
+      watchlistData !== null ||
+      universalCases.length > 0 ||
+      kybCases.length > 0 ||
+      kybOngoingCases.length > 0 ||
+      nsCases.length > 0 ||
+      realtimeTmCases.length > 0;
 
     if (!anyDataFound) {
       return {
@@ -524,59 +877,156 @@ export default api({
       };
     }
 
-    // Check if account exists but has no active cases at all
+    // ====================================================================
+    // CLASSIFY CASES ACROSS ALL SOURCES
+    // ====================================================================
+
+    // --- Active KYC cases (from kyc-service) ---
+    const activeKycCases = kycCases.filter((c) => isActive(c.caseStatus));
+
+    // --- Active TM cases from postmonitoring (non-PA) ---
+    // PA signals from TM domains
+    const PA_DOMAIN_KEYWORDS = ["PA", "RISK_OPS", "CREDIT"];
+    const paCases = tmCases.filter(
+      (c) =>
+        c.domains?.some((d) =>
+          PA_DOMAIN_KEYWORDS.some((kw) => d.toUpperCase().includes(kw)),
+        ),
+    );
+    const activeTmCases = tmCases.filter(
+      (c) => isActive(c.status) && !paCases.includes(c),
+    );
+
+    // --- Active KYB cases ---
+    const activeKybCases = kybCases.filter((c) => isActive(c.status));
+    const activeKybOngoing = kybOngoingCases.filter((c) => isActive(c.status));
+    const allActiveKyb = [...activeKybCases, ...activeKybOngoing];
+
+    // --- Active NS/Watchlist cases (not archived) ---
+    const activeNsCases = nsCases.filter(
+      (c) => c.archived !== true && isActive(c.status),
+    );
+
+    // NS categories classified for routing
+    const PA_NS_CATEGORIES = new Set([
+      "SANCTIONS",
+      "PEP",
+      "ADVERSE_MEDIA",
+      "ADVERSE MEDIA",
+      "CREDIT_CONCERN",
+      "CREDIT CONCERN",
+      "PA_ADDED",
+      "PA ADDED",
+    ]);
+    const TM_NS_CATEGORIES = new Set([
+      "ADVERSE_MEDIA",
+      "ADVERSE MEDIA",
+    ]);
+
+    const nsWithPaSignal = activeNsCases.filter((c) =>
+      (c.categories ?? []).some((cat) => PA_NS_CATEGORIES.has(cat.toUpperCase())),
+    );
+    const nsWithTmSignal = activeNsCases.filter(
+      (c) =>
+        (c.categories ?? []).some((cat) => TM_NS_CATEGORIES.has(cat.toUpperCase())) &&
+        !nsWithPaSignal.includes(c),
+    );
+
+    // --- Active realtime TM cases ---
+    const activeRealtimeTm = realtimeTmCases.filter((c) => isActive(c.status));
+
+    // --- Universal cases classified by type ---
+    const activeUniversalCases = universalCases.filter((c) => isActive(c.caseStatus));
+    const universalKycCases = activeUniversalCases.filter(
+      (c) => c.caseType?.toUpperCase().includes("KYC"),
+    );
+    const universalKybCases = activeUniversalCases.filter(
+      (c) => c.caseType?.toUpperCase().includes("KYB"),
+    );
+    const universalTmCases = activeUniversalCases.filter(
+      (c) =>
+        c.caseType?.toUpperCase().includes("TM") ||
+        c.caseType?.toUpperCase().includes("TRANSACTION"),
+    );
+    const universalPaCases = activeUniversalCases.filter(
+      (c) =>
+        c.caseType?.toUpperCase().includes("PA") ||
+        c.domains?.some((d) =>
+          PA_DOMAIN_KEYWORDS.some((kw) => d.toUpperCase().includes(kw)),
+        ),
+    );
+
+    // --- Watchlist PA signal (from account linkage) ---
+    const PA_WATCHLIST_CATEGORIES = [
+      "SANCTIONS",
+      "PEP",
+      "ADVERSE_MEDIA",
+      "ADVERSE MEDIA",
+      "CREDIT_CONCERN",
+      "CREDIT CONCERN",
+      "PA_ADDED",
+      "PA ADDED",
+      "RISK_OPS",
+    ];
+    const hasWatchlistPaSignal =
+      watchlistHitCount > 0 &&
+      watchlistCategories.some((cat) =>
+        PA_WATCHLIST_CATEGORIES.some((pa) =>
+          cat.toUpperCase().includes(pa),
+        ),
+      );
+
+    // --- Pending cardholders ---
+    const pendingCardholders = cardholders.filter(
+      (ch) => ch.status && ch.status.toUpperCase().includes("PENDING"),
+    );
+
+    // --- Aggregate "has any cases" check ---
     const hasAnyCases =
       kycCases.length > 0 ||
       tmCases.length > 0 ||
       rfiSessions.length > 0 ||
       rfiList.length > 0 ||
       cardholders.length > 0 ||
-      watchlistHitCount > 0;
+      watchlistHitCount > 0 ||
+      universalCases.length > 0 ||
+      allActiveKyb.length > 0 ||
+      activeNsCases.length > 0 ||
+      activeRealtimeTm.length > 0;
 
-    // ------ Step 3: Determine owning entity and region ------
+    // ====================================================================
+    // OWNING ENTITY + REGION
+    // ====================================================================
+
     const owningEntity =
       accountInfo?.owningEntity ??
       issuingAccount?.awxOwningEntity ??
       (kycCases.length > 0 ? kycCases[0].owningEntity : null) ??
+      (activeNsCases.length > 0 ? activeNsCases[0].owningEntity : null) ??
       null;
     const region = accountInfo?.dataCenter ?? null;
 
-    // ------ Step 4: Determine RFI status ------
-    // Combine RFI sessions and RFI list for comprehensive status
-    const allRfiItems = [
-      ...rfiSessions.map((s) => ({
-        id: s.id,
-        status: s.status,
-        type: s.type,
-      })),
-      ...rfiList.map((r) => ({
-        id: r.id,
-        status: r.status,
-        type: r.type,
-      })),
-    ];
+    // ====================================================================
+    // RFI STATUS
+    // ====================================================================
 
-    // Also check KYC case rfiStatus
-    const kycRfiStatuses = kycCases
-      .map((c) => c.rfiStatus)
+    const allRfiItems = [
+      ...rfiSessions.map((s) => ({ id: s.id, status: s.status, type: s.type })),
+      ...rfiList.map((r) => ({ id: r.id, status: r.status, type: r.type })),
+    ];
+    const kycRfiStatuses = kycCases.map((c) => c.rfiStatus).filter(Boolean);
+    // Also include NS case RFI status
+    const nsRfiStatuses = activeNsCases
+      .filter((c) => c.rfi === true)
+      .map((c) => c.rfiSessionStatus)
       .filter(Boolean);
 
     let rfiStatus: RfiStatus = "None";
-
-    // Check if any RFI is open/pending
     const hasPendingRfi = allRfiItems.some(
-      (r) =>
-        r.status === "PENDING" ||
-        r.status === "DRAFT",
+      (r) => r.status === "PENDING" || r.status === "DRAFT",
     );
-    const hasAnsweredRfi = allRfiItems.some(
-      (r) => r.status === "ANSWERED",
-    );
-    const hasClosedRfi = allRfiItems.some(
-      (r) => r.status === "CLOSED",
-    );
-
-    // Also check KYC-level RFI status strings
+    const hasAnsweredRfi = allRfiItems.some((r) => r.status === "ANSWERED");
+    const hasClosedRfi = allRfiItems.some((r) => r.status === "CLOSED");
     const hasKycOpenRfi = kycRfiStatuses.some(
       (s) =>
         s?.toUpperCase().includes("OPEN") ||
@@ -589,20 +1039,22 @@ export default api({
         s?.toUpperCase().includes("ANSWERED") ||
         s?.toUpperCase().includes("COMPLETED"),
     );
+    const hasNsOpenRfi = nsRfiStatuses.some(
+      (s) =>
+        s?.toUpperCase().includes("OPEN") ||
+        s?.toUpperCase().includes("PENDING"),
+    );
 
-    if (hasPendingRfi || hasKycOpenRfi) {
+    if (hasPendingRfi || hasKycOpenRfi || hasNsOpenRfi) {
       rfiStatus = "Open";
     } else if (hasAnsweredRfi || hasClosedRfi || hasKycClosedRfi) {
       rfiStatus = "Closed";
-    } else {
-      rfiStatus = "None";
     }
 
-    // ------ Step 5: Determine routing ------
-    const missingInputs: string[] = [];
-    const conflicts: string[] = [];
+    // ====================================================================
+    // EXTRACT USER IDENTIFIERS
+    // ====================================================================
 
-    // Track extracted user/email info
     const userId =
       input.userId ??
       (kycCases.length > 0 ? kycCases[0].openId : null) ??
@@ -617,92 +1069,82 @@ export default api({
       (cardholders.length > 0 ? cardholders[0].id : null) ??
       null;
 
-    // Check for PA Risk Ops signals (highest priority)
-    // PA signals: watchlist hits (sanctions, PEP, credit concern, adverse media),
-    // TM case domains with PA/RISK_OPS/CREDIT indicators
-    const PA_WATCHLIST_CATEGORIES = [
-      "SANCTIONS",
-      "PEP",
-      "ADVERSE_MEDIA",
-      "ADVERSE MEDIA",
-      "CREDIT_CONCERN",
-      "CREDIT CONCERN",
-      "PA_ADDED",
-      "PA ADDED",
-      "RISK_OPS",
-    ];
+    // ====================================================================
+    // ROUTING DECISION (Priority: PA Risk Ops > KYC > KYB > TM > CS)
+    // ====================================================================
 
-    const hasWatchlistPaSignal =
-      watchlistHitCount > 0 &&
-      watchlistCategories.some((cat) =>
-        PA_WATCHLIST_CATEGORIES.some((pa) =>
-          cat.toUpperCase().includes(pa),
-        ),
-      );
+    const missingInputs: string[] = [];
+    const conflicts: string[] = [];
 
-    const paCases = tmCases.filter(
-      (c) =>
-        c.domains?.some(
-          (d) =>
-            d.toUpperCase().includes("PA") ||
-            d.toUpperCase().includes("RISK_OPS") ||
-            d.toUpperCase().includes("CREDIT"),
-        ),
-    );
-
-    // Check for active KYC cases
-    const activeKycCases = kycCases.filter(
-      (c) =>
-        c.caseStatus &&
-        !["CLOSED", "COMPLETED", "REJECTED", "CANCELLED"].includes(
-          c.caseStatus.toUpperCase(),
-        ),
-    );
-
-    // Check for active TM cases (non-PA)
-    const activeTmCases = tmCases.filter(
-      (c) =>
-        c.status &&
-        !["CLOSED", "COMPLETED", "RESOLVED"].includes(
-          c.status.toUpperCase(),
-        ) &&
-        !paCases.includes(c),
-    );
-
-    // Check for pending cardholders
-    const pendingCardholders = cardholders.filter(
-      (ch) =>
-        ch.status &&
-        ch.status.toUpperCase().includes("PENDING"),
-    );
-
-    // ------ Routing Decision Logic ------
     let routingCategory: RoutingCategory;
     let escalationPoint: string;
     let currentStatus: string;
     let whatIsOutstanding: string;
     let suggestedInternalAction: string;
 
-    if (paCases.length > 0 || hasWatchlistPaSignal) {
-      // Route to PA Risk Ops
+    // ----- PA Risk Ops (highest priority) -----
+    if (
+      paCases.length > 0 ||
+      hasWatchlistPaSignal ||
+      nsWithPaSignal.length > 0 ||
+      universalPaCases.length > 0
+    ) {
       routingCategory = "PA Risk Ops";
-      if (hasWatchlistPaSignal && paCases.length === 0) {
-        escalationPoint = `Watchlist hit: ${watchlistCategories.join(", ")}`;
-        currentStatus = `${watchlistHitCount} watchlist hit(s) detected — categories: ${watchlistCategories.join(", ")}`;
-      } else {
-        escalationPoint = "PA Risk Ops case or restriction";
-        currentStatus = `PA case status: ${paCases[0].status ?? "Unknown"}`;
+
+      // Build a combined status message
+      const paSignals: string[] = [];
+      if (nsWithPaSignal.length > 0) {
+        const nsCats = [
+          ...new Set(nsWithPaSignal.flatMap((c) => c.categories ?? [])),
+        ];
+        paSignals.push(
+          `${nsWithPaSignal.length} NS case(s): ${nsCats.join(", ")}`,
+        );
       }
+      if (hasWatchlistPaSignal) {
+        paSignals.push(
+          `${watchlistHitCount} watchlist hit(s): ${watchlistCategories.join(", ")}`,
+        );
+      }
+      if (paCases.length > 0) {
+        paSignals.push(
+          `${paCases.length} PA TM case(s) — status: ${paCases[0].status ?? "Unknown"}`,
+        );
+      }
+      if (universalPaCases.length > 0) {
+        paSignals.push(
+          `${universalPaCases.length} universal PA case(s)`,
+        );
+      }
+
+      escalationPoint =
+        nsWithPaSignal.length > 0
+          ? `Name screening match: ${[...new Set(nsWithPaSignal.flatMap((c) => c.categories ?? []))].join(", ")}`
+          : hasWatchlistPaSignal
+            ? `Watchlist hit: ${watchlistCategories.join(", ")}`
+            : "PA Risk Ops case or restriction";
+
+      currentStatus = paSignals.join(" | ");
+
       whatIsOutstanding =
         rfiStatus === "Open"
           ? "Customer verification request outstanding; PA case active"
-          : hasWatchlistPaSignal
-            ? `Watchlist match requires PA Risk Ops review (${watchlistCategories.join(", ")})`
-            : "PA Risk Ops review in progress";
+          : nsWithPaSignal.length > 0
+            ? `Name screening match requires PA Risk Ops review (${[...new Set(nsWithPaSignal.flatMap((c) => c.categories ?? []))].join(", ")})`
+            : hasWatchlistPaSignal
+              ? `Watchlist match requires PA Risk Ops review (${watchlistCategories.join(", ")})`
+              : "PA Risk Ops review in progress";
+
       suggestedInternalAction =
         "Escalate to PA Risk Ops queue. Do not route to KYC.";
-    } else if (activeKycCases.length > 0 || pendingCardholders.length > 0) {
-      // Route to KYC (includes cardholder verification)
+    }
+
+    // ----- KYC -----
+    else if (
+      activeKycCases.length > 0 ||
+      pendingCardholders.length > 0 ||
+      universalKycCases.length > 0
+    ) {
       routingCategory = "KYC";
       const kycCase = activeKycCases[0] ?? null;
       const reviewType = kycCase?.reviewType ?? null;
@@ -710,10 +1152,11 @@ export default api({
       if (pendingCardholders.length > 0 && activeKycCases.length === 0) {
         escalationPoint = "Pending cardholder verification";
         currentStatus = `Cardholder status: ${pendingCardholders[0].status}`;
+      } else if (universalKycCases.length > 0 && activeKycCases.length === 0) {
+        escalationPoint = "Active KYC case (universal)";
+        currentStatus = `Universal case status: ${universalKycCases[0].caseStatus ?? "Unknown"}`;
       } else {
-        escalationPoint = reviewType
-          ? `KYC ${reviewType}`
-          : "Active KYC case";
+        escalationPoint = reviewType ? `KYC ${reviewType}` : "Active KYC case";
         currentStatus = `KYC case status: ${kycCase?.caseStatus ?? "Unknown"}`;
       }
 
@@ -728,15 +1171,60 @@ export default api({
         rfiStatus === "Open"
           ? "Advise customer to complete RFI before escalating to KYC."
           : `Escalate to KYC team${owningEntity ? ` (${owningEntity})` : ""}.`;
-    } else if (
+    }
+
+    // ----- KYB (new) -----
+    else if (allActiveKyb.length > 0 || universalKybCases.length > 0) {
+      routingCategory = "KYB";
+      const kybCase = allActiveKyb[0] ?? null;
+
+      if (kybCase) {
+        escalationPoint = kybCase.status
+          ? `KYB case — ${(kybCase as { reviewType?: string }).reviewType ?? (kybCase as { caseType?: string }).caseType ?? "review"}`
+          : "Active KYB case";
+        currentStatus = `KYB case status: ${kybCase.status ?? "Unknown"}`;
+      } else {
+        escalationPoint = "Active KYB case (universal)";
+        currentStatus = `Universal KYB case status: ${universalKybCases[0].caseStatus ?? "Unknown"}`;
+      }
+
+      whatIsOutstanding =
+        rfiStatus === "Open"
+          ? "Customer verification request outstanding; KYB review pending"
+          : "KYB review in progress";
+
+      suggestedInternalAction = `Escalate to KYB team${owningEntity ? ` (${owningEntity})` : ""}.`;
+    }
+
+    // ----- TM -----
+    else if (
       activeTmCases.length > 0 ||
+      activeRealtimeTm.length > 0 ||
+      universalTmCases.length > 0 ||
+      nsWithTmSignal.length > 0 ||
       input.transactionId ||
       input.depositId ||
       input.payoutId
     ) {
-      // Route to TM
       routingCategory = "TM";
       const tmCase = activeTmCases[0] ?? null;
+
+      // Build combined status
+      const tmSignals: string[] = [];
+      if (activeTmCases.length > 0) {
+        tmSignals.push(`${activeTmCases.length} postmonitoring case(s)`);
+      }
+      if (activeRealtimeTm.length > 0) {
+        tmSignals.push(`${activeRealtimeTm.length} realtime case(s)`);
+      }
+      if (universalTmCases.length > 0) {
+        tmSignals.push(`${universalTmCases.length} universal TM case(s)`);
+      }
+      if (nsWithTmSignal.length > 0) {
+        tmSignals.push(
+          `${nsWithTmSignal.length} NS adverse media case(s)`,
+        );
+      }
 
       if (input.depositId) {
         escalationPoint = "Deposit in review";
@@ -744,13 +1232,18 @@ export default api({
         escalationPoint = "Payout in review";
       } else if (input.transactionId) {
         escalationPoint = "Transaction in review";
+      } else if (activeRealtimeTm.length > 0) {
+        escalationPoint = "Realtime TM case active";
       } else {
         escalationPoint = "TM case active";
       }
 
-      currentStatus = tmCase
-        ? `TM case status: ${tmCase.status ?? "Unknown"}`
-        : "Under transaction review";
+      currentStatus =
+        tmSignals.length > 0
+          ? tmSignals.join(" | ")
+          : tmCase
+            ? `TM case status: ${tmCase.status ?? "Unknown"}`
+            : "Under transaction review";
 
       whatIsOutstanding =
         rfiStatus === "Open"
@@ -761,33 +1254,32 @@ export default api({
         rfiStatus === "Open"
           ? "Advise customer to complete RFI before escalating to TM."
           : `Escalate to TM${owningEntity ? ` (${owningEntity})` : ""}. Do not route to KYC.`;
-    } else if (!hasAnyCases) {
-      // Account found but no cases at all
+    }
+
+    // ----- CS (fallback: account found, no active cases) -----
+    else if (!hasAnyCases) {
       routingCategory = "CS";
       escalationPoint = "Account found — no active cases";
       currentStatus = accountInfo?.status
         ? `Account status: ${accountInfo.status}`
         : "Active (no open cases)";
-
       whatIsOutstanding =
-        "No open KYC, TM, or PA Risk Ops cases found for this account.";
-
+        "No open KYC, KYB, TM, or PA Risk Ops cases found for this account.";
       suggestedInternalAction =
         "No internal escalation needed. If the customer reports a specific issue, re-analyse with ticket context.";
-    } else {
-      // Route to CS (fallback) — cases exist but none are active/matching
+    }
+
+    // ----- CS (fallback: cases exist but none active/matching) -----
+    else {
       routingCategory = "CS";
       escalationPoint = "No matching active case found";
       currentStatus = accountInfo?.status
         ? `Account status: ${accountInfo.status}`
         : "No active case identified";
-
       whatIsOutstanding =
         "Insufficient information to route to a specific internal team";
-
       suggestedInternalAction =
         "Gather more context from the customer. If a specific issue is identified, re-analyse.";
-
       if (!input.ticketContext) {
         missingInputs.push(
           "Zendesk ticket context or customer-reported issue description",
@@ -795,10 +1287,11 @@ export default api({
       }
     }
 
-    // ------ Step 6: Build customer message ------
-    let customerMessage = RFI_MESSAGES[rfiStatus];
+    // ====================================================================
+    // CUSTOMER MESSAGE
+    // ====================================================================
 
-    // Enhance with context
+    let customerMessage = RFI_MESSAGES[rfiStatus];
     if (routingCategory === "TM" && rfiStatus === "None") {
       customerMessage =
         "No open verification request is showing. The relevant team will check the current transaction status.";
@@ -807,25 +1300,28 @@ export default api({
         "We are looking into this for you. Could you share any additional details about the issue so we can assist further?";
     }
 
-    // ------ Step 7: Check for conflicts ------
-    // Ticket context mentions KYC but no KYC case found
+    // ====================================================================
+    // CONFLICT DETECTION
+    // ====================================================================
+
     if (
       input.ticketContext &&
       input.ticketContext.toLowerCase().includes("kyc") &&
-      activeKycCases.length === 0
+      activeKycCases.length === 0 &&
+      universalKycCases.length === 0
     ) {
       conflicts.push(
         "Ticket mentions KYC but no active KYC case found for this account",
       );
     }
 
-    // Ticket mentions transaction but no TM case
     if (
       input.ticketContext &&
       (input.ticketContext.toLowerCase().includes("transaction") ||
         input.ticketContext.toLowerCase().includes("deposit") ||
         input.ticketContext.toLowerCase().includes("payout")) &&
       activeTmCases.length === 0 &&
+      activeRealtimeTm.length === 0 &&
       routingCategory !== "TM"
     ) {
       conflicts.push(
@@ -833,7 +1329,45 @@ export default api({
       );
     }
 
-    // ------ Step 8: Build recommendation ------
+    if (
+      input.ticketContext &&
+      input.ticketContext.toLowerCase().includes("watchlist") &&
+      activeNsCases.length === 0 &&
+      watchlistHitCount === 0
+    ) {
+      conflicts.push(
+        "Ticket mentions watchlist but no active NS cases or watchlist hits found",
+      );
+    }
+
+    // ====================================================================
+    // BUILD SUPPORTING INFO SUMMARIES
+    // ====================================================================
+
+    const universalCaseSummary =
+      activeUniversalCases.length > 0
+        ? `${activeUniversalCases.length} active: ${[...new Set(activeUniversalCases.map((c) => c.caseType).filter(Boolean))].join(", ")}`
+        : null;
+
+    const kybCaseStatus =
+      allActiveKyb.length > 0
+        ? `${allActiveKyb.length} active KYB case(s) — ${allActiveKyb[0].status ?? "Unknown"}`
+        : null;
+
+    const nsCasesSummary =
+      activeNsCases.length > 0
+        ? `${activeNsCases.length} active NS case(s): ${[...new Set(activeNsCases.flatMap((c) => c.categories ?? []))].join(", ")}${activeNsCases.some((c) => c.rfi) ? " | RFI active" : ""}`
+        : null;
+
+    const realtimeTmSummary =
+      activeRealtimeTm.length > 0
+        ? `${activeRealtimeTm.length} active realtime TM case(s)`
+        : null;
+
+    // ====================================================================
+    // BUILD RECOMMENDATION
+    // ====================================================================
+
     const recommendation = {
       escalationPoint,
       recommendedTeam: `${routingCategory}${owningEntity ? ` / ${owningEntity}` : ""}`,
@@ -863,6 +1397,12 @@ export default api({
               : null,
         owningEntity: owningEntity ?? null,
         region: region ?? null,
+        // New fields
+        legalEntityId: legalEntityId ?? null,
+        universalCaseSummary,
+        kybCaseStatus,
+        nsCasesSummary,
+        realtimeTmSummary,
       },
       missingInputs,
       conflicts,

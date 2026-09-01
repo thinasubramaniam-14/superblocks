@@ -34,6 +34,11 @@ interface Recommendation {
     watchlistSource: string | null;
     owningEntity: string | null;
     region: string | null;
+    legalEntityId: string | null;
+    universalCaseSummary: string | null;
+    kybCaseStatus: string | null;
+    nsCasesSummary: string | null;
+    realtimeTmSummary: string | null;
   };
   missingInputs: string[];
   conflicts: string[];
